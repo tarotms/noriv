@@ -1,4 +1,4 @@
-use crate::common::{SynthEvent, MAX_VOICES};
+use crate::common::{SynthEvent, MAX_VOICES, Param};
 use crate::voice::{Voice, VoiceState};
 
 pub struct SynthEngine {
@@ -16,8 +16,9 @@ impl SynthEngine {
     }
 
     pub fn handle_event(&mut self, event: SynthEvent) {
-            match event {
-                    SynthEvent::NoteOn(n, f) => {
+        match event {
+            
+            SynthEvent::NoteOn(n, f) => {
                 // 1. 先尝试找一个完全关闭的
                 let mut target_voice = self.voices.iter_mut().find(|v| matches!(v.state, VoiceState::Off));
 
@@ -37,6 +38,28 @@ impl SynthEngine {
                     v.note_off();
                 }
             }
+            SynthEvent::ControlChange(1, value) => {
+                // CC 1 是标准的 Mod Wheel
+                let val_f32 = value as f32 / 127.0;
+                for v in self.voices.iter_mut() {
+                    v.mod_wheel = val_f32;
+                }
+            }
+            SynthEvent::ParamChange(Param::ModRange, value) => {
+                for v in self.voices.iter_mut() {
+                    v.mod_range = value;
+                }
+            }
+            SynthEvent::ParamChange(param, val) => {
+                for v in self.voices.iter_mut() {
+                    match param {
+                        // ... 其他参数 ...
+                        Param::LfoFreq => v.lfo_freq = val,
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
         }
     }
 

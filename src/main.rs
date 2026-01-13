@@ -3,29 +3,89 @@ mod engine;
 mod voice;
 mod utils;
 
-use crate::common::SynthEvent;
+use crate::common::{SynthEvent, Param};
 use crate::engine::SynthEngine;
 use crate::utils::{msg, LogLevel, midi_to_freq};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use midir::{MidiInput, Ignore};
-use ringbuf::HeapRb;
 use std::io::{stdin, stdout, Write};
+use std::sync::mpsc; // 使用标准库 MPSC
+use eframe::egui;
 
-/*
- * ├── Cargo.toml
- * ├── src/
- * │   ├── main.rs          # 程序入口 解析命令行 初始化 MIDI/Audio 设备
- * │   ├── lib.rs           # 库入口 导出核心组件
- * │   ├── audio.rs         # CPAL 相关配置：音频流的启动、线程管理
- * │   ├── midi.rs          # MIDIR 相关配置：设备选择、消息解析
- * │   ├── engine.rs        # 合成器核心：多音管理、声音混合逻辑
- * │   ├── utils.rs         # 调试函数 通知等级
- * │   ├── voice.rs         # 单个发声单元：振荡器(Oscillator) 包络(Envelope)
- * │   └── common.rs        # 通用定义 消息枚举 常量 (如采样率)
- */
+struct SynthApp {
+    event_tx: mpsc::Sender<SynthEvent>,
+    attack: f32,
+    decay: f32,
+    sustain: f32,
+    release: f32,
+    mod_range: f32,
+    lfo_freq: f32,
+}
+
+impl SynthApp {
+    fn new(tx: mpsc::Sender<SynthEvent>) -> Self {
+        Self {
+            event_tx: tx,
+            attack: 0.1,
+            decay: 0.1,
+            sustain: 0.7,
+            release: 0.3,
+            mod_range: 20.0,
+            lfo_freq: 3.14,
+        }
+    }
+}
+
+impl eframe::App for SynthApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("Noriv Synthesizer");
+            ui.add_space(10.0);
+
+            ui.group(|ui| {
+                ui.label("ADSR setting");
+                
+                if ui.add(egui::Slider::new(&mut self.attack, 0.01..=2.0).text("Attack (s)")).changed() {
+                    let _ = self.event_tx.send(SynthEvent::ParamChange(Param::Attack, self.attack));
+                }
+                
+                if ui.add(egui::Slider::new(&mut self.decay, 0.01..=2.0).text("Decay (s)")).changed() {
+                    let _ = self.event_tx.send(SynthEvent::ParamChange(Param::Decay, self.decay));
+                }
+                
+                if ui.add(egui::Slider::new(&mut self.sustain, 0.0..=1.0).text("Sustain Level")).changed() {
+                    let _ = self.event_tx.send(SynthEvent::ParamChange(Param::Sustain, self.sustain));
+                }
+                
+                if ui.add(egui::Slider::new(&mut self.release, 0.01..=5.0).text("Release (s)")).changed() {
+                    let _ = self.event_tx.send(SynthEvent::ParamChange(Param::Release, self.release));
+                }
+            });
+
+            ui.group(|ui| {
+                ui.label("LFO");
+                // LFO 频率滑条
+                if ui.add(egui::Slider::new(&mut self.lfo_freq, 0.1..=20.0).text("LFO Freq(Hz)")).changed() {
+                    let _ = self.event_tx.send(SynthEvent::ParamChange(Param::LfoFreq, self.lfo_freq));
+                }
+
+                // 调制范围滑条
+                if ui.add(egui::Slider::new(&mut self.mod_range, 0.0..=200.0).text("FM Range (Hz)")).changed() {
+                    let _ = self.event_tx.send(SynthEvent::ParamChange(Param::ModRange, self.mod_range));
+                }
+
+                    ui.label(format!("MOD depth: MIDI CC#1"));
+                });
+
+            ui.add_space(20.0);
+            ui.label("hello synthesizer");
+        });
+    }
+}
 
 fn main() -> anyhow::Result<()> {
-    let mut midi_in = MidiInput::new("Rust MIDI Input")?;
+    // MIDI 初始化
+    let mut midi_in = MidiInput::new("MIDI Input")?;
     midi_in.ignore(Ignore::None);
     let ports = midi_in.ports();
     
@@ -35,18 +95,15 @@ fn main() -> anyhow::Result<()> {
     }
     
     msg(LogLevel::Prompt, "请选择设备序号: ");
-
     stdout().flush()?;
     let mut input = String::new();
     stdin().read_line(&mut input)?;
     let port = &ports[input.trim().parse().unwrap_or(0)];
 
-    /* 环形缓冲区初始化 */
-    let rb = HeapRb::<SynthEvent>::new(64);
-    let (mut prod, mut cons) = rb.split();
-    msg(LogLevel::Info, "环形缓冲区初始化: 完成");
+    // 使用 MPSC 通道替代 ringbuf
+    let (tx, rx) = mpsc::channel::<SynthEvent>();
 
-    /* 音频输出初始化 */
+    // 音频输出初始化
     let host = cpal::default_host();
     let device = host.default_output_device().ok_or_else(|| {
         msg(LogLevel::Error, "无输出设备");
@@ -59,40 +116,57 @@ fn main() -> anyhow::Result<()> {
 
     let mut engine = SynthEngine::new(sample_rate);
 
+    // 音频流线程
     let stream = device.build_output_stream(
         &config.into(),
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            while let Some(event) = cons.pop() {
+            // 处理所有积压的事件
+            while let Ok(event) = rx.try_recv() {
                 engine.handle_event(event);
             }
             for sample in data.iter_mut() {
                 *sample = engine.next_sample();
             }
         },
-        |err| msg(LogLevel::Error, format!("音频流错误: {}", err)), // 替换 eprint
+        |err| msg(LogLevel::Error, format!("音频流错误: {}", err)),
         None
     )?;
     stream.play()?;
 
-    /* MIDI 监听线程 */
+    // MIDI 监听线程 (克隆发送端)
+    let midi_tx = tx.clone();
     let _conn_in = midi_in.connect(port, "midir-main", move |_, message, _| {
         if message.len() >= 3 {
-            let status = message[0];
-            let note = message[1];
-            let vel = message[2];
+            let status = message[0] & 0xF0; // 获取消息类型
+            let data1 = message[1];
+            let data2 = message[2];
             
-            if status == 144 && vel > 0 {
-                let freq = midi_to_freq(note);
-                msg(LogLevel::Midi, format!("Note ON  | Key: {} | Freq: {:.2}Hz", note, freq));
-                let _ = prod.push(SynthEvent::NoteOn(note, freq));
-            } else if status == 128 || (status == 144 && vel == 0) {
-                msg(LogLevel::Midi, format!("Note OFF | Key: {}", note));
-                let _ = prod.push(SynthEvent::NoteOff(note));
+            match status {
+                144 if data2 > 0 => { // Note On
+                    let _ = midi_tx.send(SynthEvent::NoteOn(data1, midi_to_freq(data1)));
+                }
+                128 | 144 => { // Note Off
+                    let _ = midi_tx.send(SynthEvent::NoteOff(data1));
+                }
+                176 => { // Control Change
+                    let _ = midi_tx.send(SynthEvent::ControlChange(data1, data2));
+                }
+                _ => {}
             }
         }
     }, ())?;
 
-    msg(LogLevel::Info, "合成器运行中... 按回车退出");
-    stdin().read_line(&mut String::new())?;
+    // 启动 UI 窗口 (传递原始发送端)
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_inner_size([400.0, 300.0]),
+        ..Default::default()
+    };
+    
+    eframe::run_native(
+        "Noriv Synthesizer 0.0.1a",
+        options,
+        Box::new(|_cc| Box::new(SynthApp::new(tx))),
+    ).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
     Ok(())
 }
